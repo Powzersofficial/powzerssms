@@ -9,8 +9,8 @@ from telegram.ext import (
 )
 
 # === AYARLAR ===
-API_TOKEN = "7609911275:AAE09KGvE09dMZ87rb4VMHMLXM4JCCgBkjo"  # <-- Bot API Token buraya
-SMSHUB_API_KEY = "226791Ub8f14d65149d14338c92c86894072ae1"  # <-- SMSHub API Key buraya
+API_TOKEN = "7609911275:AAE09KGvE09dMZ87rb4VMHMLXM4JCCgBkjo"  # Bot API Token
+SMSHUB_API_KEY = "226791Ub8f14d65149d14338c92c86894072ae1"  # SMSHub API Key
 TRX_ADDRESS = "TYDBGuxXay6EKhjv1inFr3uzpNAwcxHyXV"
 ADMIN_ID = 6834995171
 
@@ -28,7 +28,7 @@ try:
 except FileNotFoundError:
     pass
 
-# === Ülkeler, servisler, fiyatlar, operatörler ===
+# === Ülkeler, platformlar, fiyatlar, operatörler ===
 COUNTRIES = {
     "62": "Turkey",
     "4": "Philippines",
@@ -82,22 +82,18 @@ def update_balance(uid, amount):
 def is_admin(uid):
     return uid == ADMIN_ID
 
-async def get_prices():
-    url = f"https://smshub.org/stubs/handler_api.php?api_key={SMSHUB_API_KEY}&action=getPrices"
+async def get_trx_price():
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=try"
     async with httpx.AsyncClient() as client:
         r = await client.get(url)
-        return r.json()
+        data = r.json()
+        return data["tron"]["try"]
 
 # === Komutlar ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Mesaj gönderilecek nesne belirle
-    if update.message:
-        send_target = update.message
-    elif update.callback_query:
-        send_target = update.callback_query.message
+    send_target = update.message or update.callback_query.message
+    if update.callback_query:
         await update.callback_query.answer()
-    else:
-        return
 
     keyboard = [
         [InlineKeyboardButton("📲 SMS Onay", callback_data="menu_sms")],
@@ -119,9 +115,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id
 
     if query.data == "menu_sms":
-        keyboard = []
-        for cid, cname in COUNTRIES.items():
-            keyboard.append([InlineKeyboardButton(cname, callback_data=f"country_{cid}")])
+        keyboard = [[InlineKeyboardButton(cname, callback_data=f"country_{cid}")]
+                    for cid, cname in COUNTRIES.items()]
         await query.message.delete()
         await query.message.reply_text(
             "🌍 Ülke Seç:",
@@ -190,7 +185,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "menu_balance":
         await query.message.delete()
         await query.message.reply_text(
-            f"💸 TRX Adresi:\n`{TRX_ADDRESS}`\n\nÖdeme yaptıktan sonra işlem ID gönderin.",
+            f"💸 TRX Adresi:\n`{TRX_ADDRESS}`\n\nÖdeme yaptıktan sonra **kaç TRX gönderdiğinizi** mesaj atın.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Ana Menü", callback_data="main_menu")]])
         )
@@ -229,11 +224,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Geri", callback_data="menu_admin")]]))
 
     elif query.data == "admin_add_balance":
-        if not is_admin(uid):
-            await query.message.reply_text("❌ Yetkiniz yok.")
-            return
-        # Buraya adminin kullanıcıya bakiye yüklemesi için ilave kod eklenebilir
-        await query.message.reply_text("💰 Bakiye yükleme işlemi yakında eklenecek.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Geri", callback_data="menu_admin")]]))
+        await query.message.reply_text("💰 Bu özellik yakında!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Geri", callback_data="menu_admin")]]))
 
     elif query.data == "main_menu":
         await query.message.delete()
@@ -252,9 +243,15 @@ async def check_code(context, uid, order_id):
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
-    if len(update.message.text.strip()) > 20:
-        update_balance(uid, 50)
-        await update.message.reply_text("✅ Ödeme onaylandı, 50₺ bakiye eklendi.")
+    msg = update.message.text.strip()
+    try:
+        trx_amount = float(msg)
+        price = await get_trx_price()
+        tl = trx_amount * price
+        update_balance(uid, tl)
+        await update.message.reply_text(f"✅ {trx_amount} TRX gönderildi olarak onaylandı.\n{tl:.2f}₺ bakiye yüklendi.")
+    except ValueError:
+        await update.message.reply_text("❌ Lütfen sadece gönderdiğiniz TRX miktarını sayı olarak yazın.")
 
 def main():
     app = ApplicationBuilder().token(API_TOKEN).build()
