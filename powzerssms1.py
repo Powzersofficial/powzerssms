@@ -3,6 +3,7 @@ import asyncio
 import httpx
 import json
 import base58
+import binascii
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -10,9 +11,9 @@ from telegram.ext import (
 )
 
 # === AYARLAR ===
-API_TOKEN = "7609911275:AAE09KGvE09dMZ87rb4VMHMLXM4JCCgBkjo"  # <-- Bot API Token buraya
-SMSHUB_API_KEY = "226791Ub8f14d65149d14338c92c86894072ae1"  # <-- SMSHub API Key buraya
-TRX_ADDRESS = "TYDBGuxXay6EKhjv1inFr3uzpNAwcxHyXV"
+API_TOKEN = "7609911275:AAE09KGvE09dMZ87rb4VMHMLXM4JCCgBkjo"  # <-- Bot API Token
+SMSHUB_API_KEY = "226791Ub8f14d65149d14338c92c86894072ae1"  # <-- SMSHub API Key
+TRX_ADDRESS_BASE58 = "TYDBGuxXay6EKhjv1inFr3uzpNAwcxHyXV"      # <-- TRX adresin base58 formatında
 ADMIN_ID = 6834995171
 
 logging.basicConfig(level=logging.INFO)
@@ -89,45 +90,50 @@ async def get_prices():
         r = await client.get(url)
         return r.json()
 
-def base58_to_hex(address):
-    try:
-        decoded = base58.b58decode(address)
-        return decoded[1:-4].hex()
-    except Exception as e:
-        logger.error(f"Base58 decode error: {e}")
-        return ""
-
-async def check_trx_payment(tx_id: str):
-    TRON_API = f"https://api.trongrid.io/v1/transactions/{tx_id}"
+# --- TRX İşlem ID’sini Kontrol Et ve TL tutar döndür ---
+async def check_trx_payment(txid):
+    url = f"https://api.trongrid.io/v1/transactions/{txid}"
     async with httpx.AsyncClient() as client:
-        r = await client.get(TRON_API)
-        if r.status_code == 200:
-            data = r.json()
-            try:
-                raw_data = data['data'][0]['raw_data']
-                contracts = raw_data['contract']
-                for contract in contracts:
-                    param = contract['parameter']['value']
-                    to_addr = param.get('to_address')
-                    if to_addr == base58_to_hex(TRX_ADDRESS):
-                        amount_sun = int(param.get('amount', 0))
-                        amount_trx = amount_sun / 1_000_000
-                        return amount_trx
-            except Exception as e:
-                logger.error(f"TRX check error: {e}")
-    return 0
+        r = await client.get(url)
+        data = r.json()
 
-async def get_current_trx_tl_rate():
+    if not data.get("data"):
+        return None
+
+    tx = data["data"][0]
+    if tx["ret"][0]["contractRet"] != "SUCCESS":
+        return None
+
+    raw = tx["raw_data"]["contract"][0]["parameter"]["value"]
+    amount_sun = raw.get("amount", 0)
+    to_address_hex = raw.get("to_address")
+
+    if not to_address_hex:
+        return None
+
+    # Hex to Base58
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=TRXUSDT")
-            price_usdt = float(r.json()['price'])
-            r = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=USDTTRY")
-            price_tl = float(r.json()['price'])
-            return price_usdt * price_tl
+        to_address_bytes = binascii.unhexlify(to_address_hex)
+        to_address_base58 = base58.b58encode_check(to_address_bytes).decode()
     except Exception as e:
-        logger.error(f"Kur çekme hatası: {e}")
-        return 20  # Varsayılan kur
+        logger.error(f"Adres çevirme hatası: {e}")
+        return None
+
+    if to_address_base58 != TRX_ADDRESS_BASE58:
+        return None
+
+    amount_trx = amount_sun / 1_000_000  # SUN → TRX
+
+    # Güncel TRX → TL kuru al
+    price_api = "https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=try"
+    async with httpx.AsyncClient() as client:
+        price_resp = await client.get(price_api)
+        price_json = price_resp.json()
+    trx_to_tl = price_json.get("tron", {}).get("try", 0)
+
+    amount_tl = amount_trx * trx_to_tl
+
+    return amount_tl
 
 # === Komutlar ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -230,7 +236,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "menu_balance":
         await query.message.delete()
         await query.message.reply_text(
-            f"💸 TRX Adresi:\n`{TRX_ADDRESS}`\n\nÖdeme yaptıktan sonra işlem ID gönderin.",
+            f"💸 TRX Adresi:\n`{TRX_ADDRESS_BASE58}`\n\nÖdeme yaptıktan sonra işlem ID (Transaction Hash) gönderin.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Ana Menü", callback_data="main_menu")]])
         )
@@ -272,7 +278,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid):
             await query.message.reply_text("❌ Yetkiniz yok.")
             return
-        # Buraya adminin kullanıcıya bakiye yüklemesi için ilave kod eklenebilir
+        # İstersen buraya adminin kullanıcıya bakiye yüklemesi fonksiyonu ekleyebilirsin.
         await query.message.reply_text("💰 Bakiye yükleme işlemi yakında eklenecek.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Geri", callback_data="menu_admin")]]))
 
     elif query.data == "main_menu":
@@ -290,22 +296,22 @@ async def check_code(context, uid, order_id):
                 await context.bot.send_message(uid, f"✅ Kod: `{code}`", parse_mode="Markdown")
                 break
 
+# === Mesaj işleyici (TRX işlem ID kontrolü ve bakiye ekleme) ===
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     text = update.message.text.strip()
 
-    # Eğer mesaj 64 karakter ise TRX işlem ID'si kabul edip kontrol et
+    # İşlem ID formatı (64 karakter hex) kontrolü
     if len(text) == 64 and all(c in "0123456789abcdefABCDEF" for c in text):
-        trx_amount = await check_trx_payment(text)
-        if trx_amount > 0:
-            kur = await get_current_trx_tl_rate()
-            tl_amount = trx_amount * kur
-            update_balance(uid, tl_amount)
-            await update.message.reply_text(f"✅ {trx_amount} TRX ödemeniz onaylandı. {tl_amount:.2f}₺ bakiye eklendi.")
+        amount_tl = await check_trx_payment(text)
+        if amount_tl and amount_tl > 0:
+            update_balance(uid, amount_tl)
+            await update.message.reply_text(f"✅ Ödeme onaylandı, {amount_tl:.2f}₺ bakiye eklendi.")
         else:
-            await update.message.reply_text("❌ İşlem bulunamadı veya TRX hesabınıza ulaşmadı.")
+            await update.message.reply_text("❌ İşlem bulunamadı veya TRX hesabına ulaşmadı.")
     else:
-        await update.message.reply_text("❌ Geçersiz işlem ID'si veya desteklenmeyen mesaj.")
+        # İstersen buraya başka mesaj işleme kodu ekleyebilirsin
+        await update.message.reply_text("❌ Lütfen geçerli işlem ID’si (hash) gönderin.")
 
 def main():
     app = ApplicationBuilder().token(API_TOKEN).build()
