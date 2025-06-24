@@ -1,0 +1,1 @@
+worker: python powzerssms1.py
